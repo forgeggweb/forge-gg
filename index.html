@@ -1978,23 +1978,21 @@ async function fetchPlayerFromAPI(query) {
   let record = null;
 
   if (isNumericId) {
-    // Try /user/:id first
-    record = await tryPath(`/user/${q}`);
+    record = await tryPath(`/user?user_id=${q}`)
+          || await tryPath(`/user/${q}`);
 
-    // Extract username from match player_info, then look up full profile
     if (!record) {
       try {
         const mData = await apiFetch(`/match?user_id=${q}&perPage=1&page=1`);
         if (mData && mData.records && mData.records.length > 0) {
           const info = (mData.records[0].player_info || []).find(p => String(p.user_id) === String(q));
           if (info && info.username) {
-            const uData = await tryPath(`/user/${encodeURIComponent(info.username)}`);
-            record = uData || { id: q, username: info.username, elo_rate: info.elo_rate || null };
+            record = await tryPath(`/user?username=${encodeURIComponent(info.username)}`)
+                  || { id: q, username: info.username, elo_rate: info.elo_rate || null };
           }
         }
       } catch(e) { console.warn('match username resolution failed:', e.message); }
     }
-
     if (!record) record = { id: q, username: 'Player_' + q };
 
   } else if (isAddress) {
@@ -2002,19 +2000,26 @@ async function fetchPlayerFromAPI(query) {
     if (!record) throw new Error('Wallet address not found');
 
   } else {
-    record = await tryPath(`/user/${encodeURIComponent(q)}`)
-          || await tryPath(`/user?username=${encodeURIComponent(q)}`);
-    if (!record) throw new Error(
-      `Player "${q}" not found. Try your numeric Player ID instead.`
-    );
+    record = await tryPath(`/user?username=${encodeURIComponent(q)}`)
+          || await tryPath(`/user/${encodeURIComponent(q)}`);
+    if (!record) throw new Error(`Player "${q}" not found. Try your numeric Player ID.`);
   }
 
-  const u          = record;
-  const userId     = String(u.id || u.user_id || q);
-  const username   = u.username || (isNumericId ? 'Player_' + q : q);
-  const mmr        = u.elo_rate || u.rank_score || u.elo || 1200;
+  const u        = record;
+  const userId   = String(u.id || u.user_id || q);
+  const username = u.username || (isNumericId ? 'Player_' + q : q);
+
+  let mmr = u.elo_rate || u.rank_score || u.elo || null;
+  if (!mmr) {
+    try {
+      const rankData = await apiFetch(`/rank?user_id=${userId}&game_mode=2`);
+      if (rankData && rankData.records && rankData.records.length > 0)
+        mmr = rankData.records[0].elo_rate || rankData.records[0].rank_score || 1200;
+    } catch(e) {}
+  }
+  mmr = mmr || 1200;
+
   const tier       = getRankTier(mmr);
-  const avatarUrl  = u.avatar_url || u.profile_image || null;
   const favGodRaw  = u.favorite_god || u.god || null;
   const favoriteGod = (favGodRaw && favGodRaw.toLowerCase() in GODS)
     ? favGodRaw.toLowerCase() : 'neutral';
@@ -2028,7 +2033,8 @@ async function fetchPlayerFromAPI(query) {
     tier:         tier.name,
     tierColor:    tier.color,
     joinedSeason: u.join_date ? new Date(u.join_date).getFullYear() : null,
-    favoriteGod, avatarUrl,
+    favoriteGod,
+    avatarUrl:    u.avatar_url || u.profile_image || null,
   };
 }
 
