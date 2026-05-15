@@ -1914,13 +1914,39 @@ function mockRankings() {
 }
 
 // =====================
+// =====================
+// GODS UNCHAINED API
+// Base: https://api.godsunchained.com/v0
+// CORS bloqueado — usamos corsproxy.io como proxy
+// Endpoints confirmados funcionales:
+//   GET /rank?format=compressed&sort=rating&order=desc&game_mode=2&user_id=X
+//   GET /match?user_id=X&perPage=20&page=1  (puede timeout en algunos usuarios)
+//   GET /proto?perPage=200&page=1           (catálogo de cartas)
+// =====================
+const GU_API = 'https://api.godsunchained.com/v0';
+
+async function apiFetch(path, timeoutMs = 12000) {
+  const fullUrl = GU_API + path;
+  const proxied = 'https://corsproxy.io/?' + encodeURIComponent(fullUrl);
+  const ctrl    = new AbortController();
+  const timer   = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(proxied, { signal: ctrl.signal });
+    clearTimeout(timer);
+    if (!r.ok) throw new Error('GU API ' + r.status + ' for ' + path);
+    return await r.json();
+  } catch (e) {
+    clearTimeout(timer);
+    throw e;
+  }
+}
+
+// =====================
 // CARD API INTEGRATION
 // =====================
 async function fetchCardsFromAPI() {
   try {
-    const res = await fetch('/api/gu?path=' + encodeURIComponent('/proto?perPage=200&page=1'));
-    if (!res.ok) throw new Error('API error');
-    const data = await res.json();
+    const data = await apiFetch('/proto?perPage=200&page=1');
     if (data.records && data.records.length > 0) {
       return data.records.map(c => ({
         id: String(c.id),
@@ -1935,106 +1961,86 @@ async function fetchCardsFromAPI() {
         imageUrl: `https://card.godsunchained.com/?id=${c.id}&q=4`,
       }));
     }
-  } catch (e) {}
+  } catch (e) { console.warn('fetchCardsFromAPI:', e.message); }
   return mockCards();
 }
 
 // =====================
-// GODS UNCHAINED API
-// Uses Anthropic API as intelligent proxy to bypass CORS issues
-// Falls back to direct/proxy calls when possible
-// =====================
-const GU_API = 'https://api.godsunchained.com/v0';
-
-// =====================
-// API FETCH — routes through Vercel serverless proxy (/api/gu)
-// =====================
-async function apiFetch(path) {
-  // /api/gu?path=<encoded GU path>  — served by api/gu.js on Vercel
-  const proxyUrl = '/api/gu?path=' + encodeURIComponent(path);
-  const r = await fetch(proxyUrl, { signal: AbortSignal.timeout(15000) });
-  if (!r.ok) throw new Error('GU API error ' + r.status + ' for ' + path);
-  return await r.json();
-}
-
-// =====================
 // PLAYER LOOKUP
+// Estrategia basada en endpoints confirmados funcionales:
+// 1. Si es ID numérico → /rank?user_id=X&format=compressed (devuelve rating real)
+//    luego intentamos /match para sacar username
+// 2. Si es username  → /rank?username=X&format=compressed
+// 3. Si es address   → /rank?address=X&format=compressed
 // =====================
 async function fetchPlayerFromAPI(query) {
   const q           = String(query).trim();
   const isNumericId = /^\d+$/.test(q);
   const isAddress   = q.startsWith('0x') && q.length >= 20;
 
-  async function tryPath(path) {
-    try {
-      const d = await apiFetch(path);
-      if (!d) return null;
-      if (d.id || d.username) return d;
-      if (d.records && d.records.length > 0) return d.records[0];
-    } catch(e) {}
-    return null;
-  }
+  let userId   = isNumericId ? q : null;
+  let username = null;
+  let mmr      = null;
+  let wins     = 0;
+  let losses   = 0;
+  let favoriteGod = 'neutral';
 
-  let record = null;
+  // -- Paso 1: obtener ranking real --
+  try {
+    let rankPath;
+    if (isNumericId)   rankPath = `/rank?format=compressed&user_id=${q}`;
+    else if (isAddress) rankPath = `/rank?format=compressed&address=${encodeURIComponent(q)}`;
+    else               rankPath = `/rank?format=compressed&username=${encodeURIComponent(q)}`;
 
-  if (isNumericId) {
-    record = await tryPath(`/user?user_id=${q}`)
-          || await tryPath(`/user/${q}`);
-
-    if (!record) {
-      try {
-        const mData = await apiFetch(`/match?user_id=${q}&perPage=1&page=1`);
-        if (mData && mData.records && mData.records.length > 0) {
-          const info = (mData.records[0].player_info || []).find(p => String(p.user_id) === String(q));
-          if (info && info.username) {
-            record = await tryPath(`/user?username=${encodeURIComponent(info.username)}`)
-                  || { id: q, username: info.username, elo_rate: info.elo_rate || null };
-          }
-        }
-      } catch(e) { console.warn('match username resolution failed:', e.message); }
+    const rankData = await apiFetch(rankPath);
+    if (rankData && rankData.records && rankData.records.length > 0) {
+      // Preferir game_mode 2 (Ranked Constructed), sino el primero
+      const rec = rankData.records.find(r => r.game_mode === 2) || rankData.records[0];
+      userId   = String(rec.user_id || userId || q);
+      mmr      = Math.round(rec.rating || rec.elo_rate || rec.rank_score || 1200);
+      wins     = rec.win_points   ? Math.round(rec.win_points)   : 0;
+      losses   = rec.loss_points  ? Math.round(rec.loss_points)  : 0;
+      username = rec.username || null;
     }
-    if (!record) record = { id: q, username: 'Player_' + q };
+  } catch(e) { console.warn('rank fetch failed:', e.message); }
 
-  } else if (isAddress) {
-    record = await tryPath(`/user?address=${encodeURIComponent(q)}`);
-    if (!record) throw new Error('Wallet address not found');
-
-  } else {
-    record = await tryPath(`/user?username=${encodeURIComponent(q)}`)
-          || await tryPath(`/user/${encodeURIComponent(q)}`);
-    if (!record) throw new Error(`Player "${q}" not found. Try your numeric Player ID.`);
-  }
-
-  const u        = record;
-  const userId   = String(u.id || u.user_id || q);
-  const username = u.username || (isNumericId ? 'Player_' + q : q);
-
-  let mmr = u.elo_rate || u.rank_score || u.elo || null;
-  if (!mmr) {
+  // -- Paso 2: si no tenemos username, intentar sacarlo de /match --
+  if (!username && userId) {
     try {
-      const rankData = await apiFetch(`/rank?user_id=${userId}&game_mode=2`);
-      if (rankData && rankData.records && rankData.records.length > 0)
-        mmr = rankData.records[0].elo_rate || rankData.records[0].rank_score || 1200;
-    } catch(e) {}
+      const mData = await apiFetch(`/match?user_id=${userId}&perPage=1&page=1`, 8000);
+      if (mData && mData.records && mData.records.length > 0) {
+        const info = (mData.records[0].player_info || []).find(p => String(p.user_id) === String(userId));
+        if (info) {
+          username    = info.username || null;
+          favoriteGod = guGodKey(info.god) || 'neutral';
+        }
+      }
+    } catch(e) { console.warn('match username lookup failed:', e.message); }
   }
-  mmr = mmr || 1200;
 
-  const tier       = getRankTier(mmr);
-  const favGodRaw  = u.favorite_god || u.god || null;
-  const favoriteGod = (favGodRaw && favGodRaw.toLowerCase() in GODS)
-    ? favGodRaw.toLowerCase() : 'neutral';
+  // -- Fallback de username --
+  if (!username) {
+    username = isNumericId ? 'Player_' + q : q;
+  }
+  if (!userId) {
+    if (isNumericId) userId = q;
+    else throw new Error(`Player "${q}" not found. Try your numeric Player ID.`);
+  }
+
+  mmr = mmr || 1200;
+  const tier = getRankTier(mmr);
 
   return {
     username, userId,
-    address:      u.address || '',
+    address:      isAddress ? q : '',
     mmr,
-    wins:         u.win_count  || u.wins   || 0,
-    losses:       u.loss_count || u.losses || 0,
+    wins,
+    losses,
     tier:         tier.name,
     tierColor:    tier.color,
-    joinedSeason: u.join_date ? new Date(u.join_date).getFullYear() : null,
+    joinedSeason: null,
     favoriteGod,
-    avatarUrl:    u.avatar_url || u.profile_image || null,
+    avatarUrl:    null,
   };
 }
 
@@ -2060,7 +2066,8 @@ function mapMatches(records, userId) {
 async function fetchMatchesFromAPI(userId) {
   if (!userId) return mockMatches(20);
   try {
-    const data = await apiFetch(`/match?user_id=${userId}&perPage=20&page=1`);
+    // timeout corto porque este endpoint puede ser lento
+    const data = await apiFetch(`/match?user_id=${userId}&perPage=20&page=1`, 10000);
     if (data && data.records && data.records.length > 0) return mapMatches(data.records, userId);
   } catch(e) { console.warn('fetchMatchesFromAPI failed:', e.message); }
   return mockMatches(20);
@@ -2068,14 +2075,15 @@ async function fetchMatchesFromAPI(userId) {
 
 async function fetchRankingsFromAPI() {
   try {
-    const data = await apiFetch('/ranking?perPage=30&page=1');
+    // /rank con format=compressed y sort=rating es el endpoint confirmado de GUDecks
+    const data = await apiFetch('/rank?format=compressed&sort=rating&order=desc&perPage=30&page=1');
     if (data && data.records && data.records.length > 0) {
       return data.records.map((r, i) => ({
         rank:   i + 1,
-        name:   r.username || `Player_${i+1}`,
-        mmr:    r.elo_rate || r.rank_score || 1200,
-        wins:   r.win_count  || 0,
-        losses: r.loss_count || 0,
+        name:   r.username || `Player_${r.user_id || i+1}`,
+        mmr:    Math.round(r.rating || r.elo_rate || r.rank_score || 1200),
+        wins:   r.win_points   ? Math.round(r.win_points)  : 0,
+        losses: r.loss_points  ? Math.round(r.loss_points) : 0,
         favGod: 'neutral',
       }));
     }
